@@ -438,24 +438,34 @@ impl Render for PlayerView {
                 canvas(
                     move |bounds, _, _| {
                         if let Some(m) = &mpv {
-                            // Render at the video's own resolution (capped at 1080p), or
-                            // smaller when the player shows it smaller: every frame is
-                            // converted, copied and uploaded, so pixels nobody sees cost
-                            // CPU, memory and GPU time. The GPU scales the image for display.
+                            // Render at the video's own resolution (capped at 1080p): mpv then
+                            // Render no larger than the video's native size, the viewport's
+                            // physical pixel box, or the configured cap (default 720p on aarch64 Linux,
+                            // 1080p elsewhere): keeps mini-player and tablet playback light while GPU scales cleanly.
+                            static MAX_H: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+                            let max_h = *MAX_H.get_or_init(|| {
+                                std::env::var("STREAMTUBE_MAX_RENDER_H")
+                                    .ok()
+                                    .and_then(|v| v.parse::<f32>().ok())
+                                    .map(|v| v.clamp(360.0, 2160.0))
+                                    .unwrap_or_else(|| {
+                                        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                                            720.0
+                                        } else {
+                                            1080.0
+                                        }
+                                    })
+                            });
+                            let max_w = max_h * (16.0 / 9.0);
+                            let aw = (f32::from(bounds.size.width) * scale).max(16.0);
+                            let ah = (f32::from(bounds.size.height) * scale).max(16.0);
                             let (vw, vh) = (vsize.0 as f32, vsize.1 as f32);
                             if vw > 0.0 && vh > 0.0 {
-                                let cap = (1920.0 / vw).min(1080.0 / vh).min(1.0);
-                                let aw = f32::from(bounds.size.width) * scale;
-                                let ah = f32::from(bounds.size.height) * scale;
-                                // enough to cover the player; cropping modes enlarge a part of the frame
-                                let crops = matches!(aspect, aspect::Mode::Auto | aspect::Mode::Ratio(_));
-                                let need = (aw / (vw * cap)).max(ah / (vh * cap)) * if crops { 1.35 } else { 1.0 };
-                                // in eighths, so resizing the window doesn't change the size every frame
-                                let k = cap * ((need * 8.0).ceil() / 8.0).clamp(0.25, 1.0);
-                                m.set_render_size((vw * k) as u32, (vh * k) as u32);
+                                let cap_w = max_w.min(aw);
+                                let cap_h = max_h.min(ah);
+                                let k = (cap_w / vw).min(cap_h / vh).min(1.0);
+                                m.set_render_size(((vw * k).round() as u32).max(16), ((vh * k).round() as u32).max(16));
                             } else {
-                                let aw = f32::from(bounds.size.width) * scale;
-                                let ah = f32::from(bounds.size.height) * scale;
                                 m.set_render_size((aw as u32).min(1280), (ah as u32).min(720));
                             }
                         }

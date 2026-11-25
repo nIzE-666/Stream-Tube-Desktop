@@ -185,14 +185,18 @@ impl Default for Settings {
             language: "en".into(),
             original_video_titles: false,
             stream_backend: "auto".into(),
-            display_server: "auto".into(),
+            display_server: if cfg!(all(target_os = "linux", target_arch = "aarch64")) { "wayland".into() } else { "auto".into() },
             ytdlp_path: String::new(),
             proxy: String::new(),
             theater_mode: false,
             theater_full_height: false,
             pip_always_on_top: false,
             default_quality: 1080,
-            codec_pref: "vp9".into(),
+            codec_pref: if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                "h264".into()
+            } else {
+                "vp9".into()
+            },
             default_speed: 1.0,
             remember_speed_per_channel: true,
             audio_compressor: false,
@@ -201,7 +205,7 @@ impl Default for Settings {
             autoplay_next: true,
             resume_playback: true,
             volume: 80.0,
-            hwdec: true,
+            hwdec: !cfg!(all(target_os = "linux", target_arch = "aarch64")),
             audio_only: false,
             captions_enabled: false,
             captions_lang: "en".into(),
@@ -235,7 +239,7 @@ impl Default for Settings {
             hidden_videos: Vec::new(),
             history_enabled: true,
             search_history_enabled: true,
-            check_updates: true,
+            check_updates: !cfg!(all(target_os = "linux", target_arch = "aarch64")),
             feed_source: "full".into(),
             feed_include_shorts: false,
             feed_include_live: true,
@@ -270,7 +274,7 @@ impl Default for Settings {
             ipv4_only: true,
             background_play: true,
             independent_tab_playback: false,
-            ambient_mode: true,
+            ambient_mode: !cfg!(all(target_os = "linux", target_arch = "aarch64")),
             shorts_in_player: false,
             shorts_autoadvance: false,
             shorts_preload: 1,
@@ -283,7 +287,7 @@ impl Default for Settings {
             controls_shade: "default".into(),
             double_click_fullscreen: true,
             original_audio: true,
-            hover_preview: true,
+            hover_preview: !cfg!(all(target_os = "linux", target_arch = "aarch64")),
         }
     }
 }
@@ -409,7 +413,13 @@ pub fn mpv_http_proxy(p: &str) -> bool {
 
 pub fn proxy_setting() -> Option<String> {
     let p = settings_snapshot().proxy.clone();
-    (!p.trim().is_empty()).then_some(p)
+    if !p.trim().is_empty() {
+        return Some(p);
+    }
+    std::env::var("STREAMTUBE_DEFAULT_PROXY")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// The profile holds the sign-in (OAuth tokens and Google cookies), so on Linux and

@@ -74,7 +74,7 @@ pub fn scroll_viewport<H: PageScrollHandle + Clone + 'static, E: IntoElement>(
 ) -> impl IntoElement + use<H, E> {
     let shared: Rc<dyn PageScrollHandle> = Rc::new(handle.clone());
     ACTIVE_PAGE.with(|a| *a.borrow_mut() = Some((id, shared.clone())));
-    let mode = if crate::store::settings_snapshot().always_scrollbars { ScrollbarMode::Always } else { ScrollbarMode::Hover };
+    let mode = if crate::store::settings_snapshot().always_scrollbars || touch_scroll_enabled() { ScrollbarMode::Always } else { ScrollbarMode::Hover };
     div()
         .id(id)
         .relative()
@@ -114,16 +114,46 @@ thread_local! {
     static GLIDES: std::cell::RefCell<std::collections::HashMap<&'static str, Glide>> = Default::default();
 }
 
+fn touch_scroll_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var("STREAMTUBE_TOUCH_INERTIA").ok().as_deref() {
+        Some("1" | "true" | "TRUE" | "yes") => true,
+        Some("0" | "false" | "FALSE" | "no") => false,
+        _ => cfg!(all(target_os = "linux", target_arch = "aarch64")),
+    })
+}
+
 struct Glide {
     /// where the page is drawn now / where it's heading (offset.y, <= 0)
     shown: f32,
     target: f32,
     last: std::time::Instant,
-    /// the last wheel event came from a touchpad
+    /// the last wheel event came from a touchpad / touch-scroll
     precise: bool,
     /// a mouse wheel moved the page since the last frame (anything else that
     /// moves it, like dragging the scrollbar, is followed exactly)
     wheel: Option<std::time::Instant>,
+    /// tablet kinetic flick state (px/sec, negative = scrolling down)
+    vel: f32,
+    last_vel_at: std::time::Instant,
+    last_scroll_at: Option<std::time::Instant>,
+    coasting: bool,
+}
+
+impl Glide {
+    fn new(now: std::time::Instant, pos: f32, precise: bool) -> Self {
+        Self {
+            shown: pos,
+            target: pos,
+            last: now,
+            precise,
+            wheel: None,
+            vel: 0.0,
+            last_vel_at: now,
+            last_scroll_at: None,
+            coasting: false,
+        }
+    }
 }
 
 /// Scrolls the page on screen for PageUp/PageDown, Home/End, the arrow keys and
@@ -150,7 +180,7 @@ pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
     let now: f32 = handle.offset().y.into();
     GLIDES.with(|g| {
         let mut g = g.borrow_mut();
-        let st = g.entry(id).or_insert(Glide { shown: now, target: now, last: std::time::Instant::now(), precise: false, wheel: None });
+        let st = g.entry(id).or_insert_with(|| Glide::new(std::time::Instant::now(), now, false));
         // from where it's already heading, so repeated presses add up
         let in_flight = (st.target - now).abs() > 0.5 && !st.precise;
         let from = if in_flight { st.target } else { now };
@@ -165,16 +195,18 @@ pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
     true
 }
 
-/// Mouse-wheel scrolling that glides instead of jumping a fixed step per notch.
-/// gpui moves the page by the whole step; this notices the jump, keeps it as the
-/// target and eases the visible position there over the next frames. Touchpad
-/// scrolling is already smooth and passes through untouched.
+/// Mouse-wheel scrolling that glides instead of jumping a fixed step per notch,
+/// plus tablet touch-flick kinetic inertia (zero drag lag, smooth coast on lift).
 fn smooth_scroll(id: &'static str, handle: Rc<dyn PageScrollHandle>) -> impl IntoElement {
-    /// how quickly it settles: ~63% of the way every TAU
+    /// how quickly mouse-wheel glide settles: ~63% of the way every TAU
     const TAU: f32 = 0.045;
     /// mouse-wheel notches move a bit further than gpui's line step
     const WHEEL_BOOST: f32 = 1.4;
+    /// tablet flick coast decay time constant (seconds)
+    const FLICK_TAU: f32 = 0.28;
     let wheel_handle = handle.clone();
+    let tap_handle = handle.clone();
+    let touch_inertia = touch_scroll_enabled();
     canvas(
         move |_, window, _| {
             let now = std::time::Instant::now();
@@ -182,20 +214,78 @@ fn smooth_scroll(id: &'static str, handle: Rc<dyn PageScrollHandle>) -> impl Int
             let max: f32 = scroll_limit(handle.as_ref()).into();
             GLIDES.with(|g| {
                 let mut g = g.borrow_mut();
-                let st = g.entry(id).or_insert(Glide { shown: actual, target: actual, last: now, precise: false, wheel: None });
+                let st = g.entry(id).or_insert_with(|| Glide::new(now, actual, false));
                 let wheel = st.wheel.take();
                 let moved = actual - st.shown;
-                if moved.abs() > 0.01 {
+                if moved.abs() > 0.05 {
                     // something moved the page since the last frame
+                    if st.precise && touch_inertia {
+                        if let Some(wheel_at) = wheel.filter(|_| moved.abs() <= 2500.0) {
+                            let dt = now.duration_since(st.last_vel_at).as_secs_f32();
+                            let inst_v = (moved / dt.clamp(0.010, 0.060)).clamp(-5500.0, 5500.0);
+                            if dt > 0.11 || (st.vel != 0.0 && inst_v.signum() != st.vel.signum()) {
+                                st.vel = inst_v;
+                            } else {
+                                st.vel = st.vel * 0.5 + inst_v * 0.5;
+                            }
+                            st.last_vel_at = wheel_at;
+                            st.shown = actual;
+                            st.target = actual;
+                            st.last = now;
+                            st.coasting = false;
+                            if st.vel.abs() > 220.0 {
+                                window.request_animation_frame();
+                            }
+                            return;
+                        }
+                        *st = Glide::new(now, actual, st.precise);
+                        return;
+                    }
                     let Some(wheel_at) = wheel.filter(|_| !st.precise && moved.abs() <= 3000.0) else {
                         // touchpad, the scrollbar, or a jump (new page, scroll to top): follow it exactly
-                        *st = Glide { shown: actual, target: actual, last: now, precise: st.precise, wheel: None };
+                        *st = Glide::new(now, actual, st.precise);
                         return;
                     };
                     if (st.target - st.shown).abs() < 0.5 {
                         st.last = wheel_at;
                     }
                     st.target += moved * WHEEL_BOOST;
+                } else if st.precise && touch_inertia && st.vel.abs() > 25.0 {
+                    let idle = st.last_scroll_at.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0);
+                    if !st.coasting {
+                        if idle < 0.050 {
+                            // Still within finger-motion tick interval; wait one more frame before coasting.
+                            st.last = now;
+                            window.request_animation_frame();
+                            return;
+                        }
+                        if idle > 0.18 || st.vel.abs() < 220.0 {
+                            st.vel = 0.0;
+                            st.last = now;
+                            return;
+                        }
+                        st.coasting = true;
+                        st.last = now;
+                        window.request_animation_frame();
+                        return;
+                    }
+                    let dt = now.duration_since(st.last).as_secs_f32().clamp(0.001, 0.033);
+                    let next = (actual + st.vel * dt).clamp(-max.max(0.0), 0.0);
+                    st.vel *= (-dt / FLICK_TAU).exp();
+                    st.last = now;
+                    if (next - actual).abs() < 0.15 || st.vel.abs() < 25.0 {
+                        st.vel = 0.0;
+                        st.coasting = false;
+                        st.shown = actual;
+                        st.target = actual;
+                    } else {
+                        handle.set_offset(point(handle.offset().x, px(next)));
+                        let applied: f32 = handle.offset().y.into();
+                        st.shown = applied;
+                        st.target = applied;
+                        window.request_animation_frame();
+                    }
+                    return;
                 }
                 st.target = st.target.clamp(-max.max(0.0), 0.0);
                 let gap = st.target - st.shown;
@@ -209,6 +299,8 @@ fn smooth_scroll(id: &'static str, handle: Rc<dyn PageScrollHandle>) -> impl Int
                 st.last = now;
                 if (st.shown - actual).abs() > 0.01 {
                     handle.set_offset(point(handle.offset().x, px(st.shown)));
+                    let applied: f32 = handle.offset().y.into();
+                    st.shown = applied;
                 }
             });
         },
@@ -216,10 +308,24 @@ fn smooth_scroll(id: &'static str, handle: Rc<dyn PageScrollHandle>) -> impl Int
             let wheel_handle = wheel_handle.clone();
             window.on_mouse_event(move |ev: &ScrollEvent, phase, _, _| {
                 if phase == DispatchPhase::Capture && wheel_handle.viewport_bounds().contains(&ev.position) {
+                    let now = std::time::Instant::now();
                     GLIDES.with(|g| {
                         if let Some(st) = g.borrow_mut().get_mut(id) {
                             st.precise = ev.delta.precise();
-                            st.wheel.get_or_insert_with(std::time::Instant::now);
+                            st.wheel.get_or_insert(now);
+                            st.last_scroll_at = Some(now);
+                            st.coasting = false;
+                        }
+                    });
+                }
+            });
+            let tap_handle = tap_handle.clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture && tap_handle.viewport_bounds().contains(&ev.position) {
+                    GLIDES.with(|g| {
+                        if let Some(st) = g.borrow_mut().get_mut(id) {
+                            st.vel = 0.0;
+                            st.coasting = false;
                         }
                     });
                 }

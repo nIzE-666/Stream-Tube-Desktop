@@ -622,7 +622,8 @@ impl Player {
         let (tx, rx) = futures::channel::mpsc::unbounded::<MpvEvent>();
         let vol = format!("{}", s.volume.round());
         let ua = crate::api::http::BROWSER_UA;
-        let hw = if s.hwdec { "auto-copy" } else { "no" };
+        let hw_override = std::env::var("STREAMTUBE_MPV_HWDEC").ok().filter(|v| !v.is_empty());
+        let hw = hw_override.as_deref().unwrap_or(if s.hwdec { "auto-copy" } else { "no" });
         let af = self.audio_filter_chain(&s.eq_preset);
         let opts: Vec<(&str, &str)> = vec![
             ("vo", "libmpv"),
@@ -666,7 +667,7 @@ impl Player {
             ("framedrop", "vo"),
         ];
         let opts: Vec<(&str, &str)> = opts.into_iter().collect();
-        let proxy = s.proxy.clone();
+        let proxy = crate::store::proxy_setting().unwrap_or_default();
         let mut opts_owned: Vec<(String, String)> = opts.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         // Embedded libmpv can have no default cache directory.
         let cache_dir = store::data_dir().join("playback-cache");
@@ -678,6 +679,39 @@ impl Player {
             }
         };
         opts_owned.push(("demuxer-cache-dir".into(), cache_dir.to_string_lossy().into_owned()));
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            for &(k, v) in &[
+                ("dither-depth", "no"),
+                ("deband", "no"),
+                ("correct-downscaling", "no"),
+                ("sigmoid-upscaling", "no"),
+                ("interpolation", "no"),
+                ("scale", "bilinear"),
+                ("cscale", "bilinear"),
+                ("dscale", "bilinear"),
+                ("audio-channels", "stereo"),
+            ] {
+                opts_owned.push((k.into(), v.into()));
+            }
+        }
+        if let Some(t) = std::env::var("STREAMTUBE_MPV_THREADS").ok().filter(|v| !v.is_empty()) {
+            opts_owned.push(("vd-lavc-threads".into(), t));
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            opts_owned.push(("vd-lavc-threads".into(), "4".into()));
+        }
+        if let Some(ao) = std::env::var("STREAMTUBE_MPV_AO").ok().filter(|v| !v.is_empty()) {
+            opts_owned.push(("ao".into(), ao));
+        }
+        if let Some(ab) = std::env::var("STREAMTUBE_MPV_AUDIO_BUFFER").ok().filter(|v| !v.is_empty()) {
+            opts_owned.push(("audio-buffer".into(), ab));
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            opts_owned.push(("audio-buffer".into(), "0.2".into()));
+        }
+        if let Some(sr) = std::env::var("STREAMTUBE_MPV_AUDIO_RATE").ok().filter(|v| !v.is_empty()) {
+            opts_owned.push(("audio-samplerate".into(), sr));
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            opts_owned.push(("audio-samplerate".into(), "48000".into()));
+        }
         // normal videos reach mpv through the app's local stream proxy, which already
         // uses the user's proxy; mpv itself only fetches live streams directly, and can
         // only use HTTP proxies (127.0.0.1 is excluded through no_proxy, see main)
@@ -1254,8 +1288,10 @@ impl Player {
                 report.start(t, self.duration);
             }
         }
-        // progress save
-        if !self.loading && !self.eof && (t - self.last_progress_save).abs() >= 5.0 {
+        // progress save (less frequent on aarch64 Linux to reduce flash/UFS write wear;
+        // forced saves still run on video switch, end of playback, and exit)
+        let save_every = if cfg!(all(target_os = "linux", target_arch = "aarch64")) { 15.0 } else { 5.0 };
+        if !self.loading && !self.eof && (t - self.last_progress_save).abs() >= save_every {
             if self.is_live() {
                 self.last_progress_save = t;
             } else {

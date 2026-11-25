@@ -3900,11 +3900,24 @@ impl Render for AppView {
         let is_shorts = matches!(self.route, Route::Shorts(_));
         // only on a change: writing a global notifies its observers, this view among them
         let vp = window.viewport_size();
-        let ui = *cx.global::<UiState>();
-        if ui.viewport != vp || ui.shorts != is_shorts {
-            let ui = cx.global_mut::<UiState>();
-            ui.viewport = vp;
-            ui.shorts = is_shorts;
+        let mut ui = *cx.global::<UiState>();
+        let prev_w = f32::from(ui.viewport.width);
+        let cur_w = f32::from(vp.width);
+        let new_sidebar = if (prev_w <= 1.0 || prev_w >= 1000.0) && cur_w > 1.0 && cur_w < 1000.0 {
+            Some(false)
+        } else if prev_w > 1.0 && prev_w < 1000.0 && cur_w >= 1000.0 {
+            Some(true)
+        } else {
+            None
+        };
+        if ui.viewport != vp || ui.shorts != is_shorts || new_sidebar.is_some_and(|v| v != ui.sidebar_open) {
+            let g = cx.global_mut::<UiState>();
+            g.viewport = vp;
+            g.shorts = is_shorts;
+            if let Some(open) = new_sidebar {
+                g.sidebar_open = open;
+            }
+            ui = *g;
         }
         let fullscreen = ui.fullscreen && (is_watch || is_shorts);
         let mut root = div()
@@ -4095,6 +4108,9 @@ fn drag_gap(id: &'static str) -> Stateful<Div> {
 /// Minimize / maximize / close, drawn in the top bar. The OS handles the clicks
 /// (WindowControlArea), so Snap Layouts on the maximize button work as usual.
 fn window_controls(maximized: bool, cx: &App) -> impl IntoElement {
+    if std::env::var_os("STREAMTUBE_HIDE_WINDOW_CONTROLS").is_some_and(|v| v != "0" && !v.is_empty()) {
+        return div().w_1();
+    }
     let p = pal(cx);
     let btn = |id: &'static str, icon_name: &'static str, area: WindowControlArea, close: bool| {
         div()
