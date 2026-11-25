@@ -62,9 +62,14 @@ embed-resource = "3"
 
 # GPUI's Windows text backend with one fix: right-to-left text (Arabic, Hebrew)
 # needs visual glyph ordering. See vendor/gpui-pre-windows/PATCHES.md.
+# Xiaomi Pad 6 (pipa / Ubuntu Touch Halium 13 / Adreno 650 GLES 3.2) patches:
+# see vendor/PIPA_PATCHES.md.
 [patch.crates-io]
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # xim-ctext 0.3 with a decoder that handles non-UTF-8 compound text such as
 # Cyrillic, which made typing in some Linux input methods crash the app (#248).
 # See vendor/xim-ctext/Cargo.toml.
 xim-ctext = { path = "vendor/xim-ctext" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
