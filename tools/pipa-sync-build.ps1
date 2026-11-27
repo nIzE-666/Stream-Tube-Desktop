@@ -60,17 +60,27 @@ try {
     }
     Remove-Item -Force $tmpTar
 
-    Write-Host "==> Syncing source tree on pipa (preserving target/)..."
+    $vendorTree = (git rev-parse HEAD:vendor).Trim()
+    Write-Host "==> Syncing source tree on pipa (preserving target/ and unchanged vendor/)..."
     $syncScript = @"
 set -eu
 mkdir -p "$RemoteDir"
-rm -rf "$RemoteDir/src" "$RemoteDir/vendor" "$RemoteDir/assets" "$RemoteDir/tools"
-tar -xzf /tmp/streamtube-src.tar.gz -C "$RemoteDir"
+OLD_VENDOR=""
+if [ -f "$RemoteDir/.vendor-tree" ]; then OLD_VENDOR=`$(cat "$RemoteDir/.vendor-tree"); fi
+if [ "`$OLD_VENDOR" = "$vendorTree" ] && [ -d "$RemoteDir/vendor" ]; then
+    rm -rf "$RemoteDir/src" "$RemoteDir/assets" "$RemoteDir/tools"
+    tar -xzf /tmp/streamtube-src.tar.gz --exclude='./vendor' --exclude='vendor' -C "$RemoteDir"
+    echo "vendor/ unchanged ($vendorTree) -> fast incremental build"
+else
+    rm -rf "$RemoteDir/src" "$RemoteDir/vendor" "$RemoteDir/assets" "$RemoteDir/tools"
+    tar -xzf /tmp/streamtube-src.tar.gz -C "$RemoteDir"
+    printf '%s\n' "$vendorTree" > "$RemoteDir/.vendor-tree"
+    echo "vendor/ synced ($vendorTree)"
+fi
 rm -f /tmp/streamtube-src.tar.gz
-ls -la "$RemoteDir/vendor"
 "@
     Invoke-Checked -StepName "remote source sync" -Action {
-        $syncScript | ssh -T $SshHost "tr -d '\r' | bash -s"
+        $syncScript | ssh -T $SshHost "sed '1s/^\xef\xbb\xbf//' | tr -d '\r' | bash -s"
     }
 
     if ($SkipBuild) {
@@ -107,7 +117,7 @@ ls -lh /home/phablet/.local/share/streamtube-app/streamtube
 echo "INSTALLED_OK v$version ($commit)"
 "@
     Invoke-Checked -StepName "remote devroot build & install" -Action {
-        $buildScript | ssh -T $SshHost "tr -d '\r' | bash -s"
+        $buildScript | ssh -T $SshHost "sed '1s/^\xef\xbb\xbf//' | tr -d '\r' | bash -s"
     }
     Write-Host "==> Done! Stream Tube v$version ($commit) installed on $SshHost." -ForegroundColor Green
 }

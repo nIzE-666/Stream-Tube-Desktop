@@ -697,7 +697,7 @@ impl Player {
         if let Some(t) = std::env::var("STREAMTUBE_MPV_THREADS").ok().filter(|v| !v.is_empty()) {
             opts_owned.push(("vd-lavc-threads".into(), t));
         } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            opts_owned.push(("vd-lavc-threads".into(), "4".into()));
+            opts_owned.push(("vd-lavc-threads".into(), "6".into()));
         }
         if let Some(ao) = std::env::var("STREAMTUBE_MPV_AO").ok().filter(|v| !v.is_empty()) {
             opts_owned.push(("ao".into(), ao));
