@@ -29,6 +29,13 @@ struct PendingUpload {
     data: Vec<u8>,
 }
 
+struct RecycledTexture {
+    size: Size<DevicePixels>,
+    format: wgpu::TextureFormat,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 struct WgpuAtlasTextures {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -36,6 +43,7 @@ struct WgpuAtlasTextures {
     color_texture_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
+    recycled_textures: Vec<RecycledTexture>,
     next_texture_generation: u64,
 }
 
@@ -59,8 +67,13 @@ impl WgpuAtlas {
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
+            recycled_textures: Vec::new(),
             next_texture_generation: 0,
         })))
+    }
+
+    pub fn color_texture_format(&self) -> wgpu::TextureFormat {
+        self.0.lock().backend.color_texture_format
     }
 
     pub fn from_context(context: &WgpuContext) -> Self {
@@ -95,6 +108,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.recycled_textures.clear();
         });
     }
 
@@ -107,6 +121,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.recycled_textures.clear();
         });
     }
 }
@@ -152,6 +167,20 @@ impl AtlasBackend for WgpuAtlasTextures {
                 self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
+                // Pool dedicated large textures (e.g. 1080p/720p video frames) so
+                // streaming playback reuses GPU storage instead of calling
+                // glTexStorage2D / glDeleteTextures every frame.
+                if texture.size.width.0 > 1024 || texture.size.height.0 > 1024 {
+                    if self.recycled_textures.len() >= 2 {
+                        self.recycled_textures.remove(0);
+                    }
+                    self.recycled_textures.push(RecycledTexture {
+                        size: texture.size,
+                        format: texture.format,
+                        texture: texture.texture,
+                        view: texture.view,
+                    });
+                }
             } else {
                 *texture_slot = Some(texture);
             }
@@ -202,22 +231,32 @@ impl WgpuAtlasTextures {
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
         };
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: wgpu::Extent3d {
-                width: size.width.0 as u32,
-                height: size.height.0 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let (texture, view) = if let Some(pos) = self
+            .recycled_textures
+            .iter()
+            .rposition(|r| r.size == size && r.format == format)
+        {
+            let recycled = self.recycled_textures.swap_remove(pos);
+            (recycled.texture, recycled.view)
+        } else {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("atlas"),
+                size: wgpu::Extent3d {
+                    width: size.width.0 as u32,
+                    height: size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
 
         let texture_list = &mut self.storage[kind];
         let index = texture_list.free_list.pop();
@@ -230,6 +269,7 @@ impl WgpuAtlasTextures {
                 kind,
             },
             generation,
+            size,
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             format,
             texture,
@@ -255,11 +295,17 @@ impl WgpuAtlasTextures {
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
+        // Polychrome textures on Rgba8Unorm (GLES/WebGL) are swizzled to BGRA in
+        // `fs_poly_sprite` on the GPU, avoiding an expensive per-frame CPU byte-swap
+        // across 8 MB 1080p video frames on the UI thread.
+        let data = if id.kind == AtlasTextureKind::Polychrome {
+            bytes.to_vec()
+        } else {
+            self.storage
+                .get(id)
+                .map(|texture| swizzle_upload_data(bytes, texture.format))
+                .unwrap_or_else(|| bytes.to_vec())
+        };
 
         self.pending_uploads
             .push(PendingUpload { id, bounds, data });
@@ -339,6 +385,7 @@ impl WgpuAtlasStorage {
 struct WgpuAtlasTexture {
     id: AtlasTextureId,
     generation: u64,
+    size: Size<DevicePixels>,
     allocator: BucketedAtlasAllocator,
     texture: wgpu::Texture,
     view: wgpu::TextureView,

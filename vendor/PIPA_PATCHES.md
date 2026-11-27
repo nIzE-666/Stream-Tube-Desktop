@@ -21,8 +21,10 @@ All behavior is opt-in via environment variables or guarded to OpenGL ES, leavin
   - Use `Rgba8Unorm` color atlas on native `wgpu::Backend::Gl` (matches GLES texture formats without swizzle penalty).
   - `STREAMTUBE_WEBGL_INSTANCES=1`: fetch GPUI quad/sprite instance data via `Rgba32Uint` texture (`texelFetch`, L1 texture cache) instead of per-pixel SSBO reads in `fs_quad` (fixes 258 ms Adreno 650 GLES SSBO bottleneck: ~4 fps -> 75-92 fps).
   - `STREAMTUBE_NO_DUAL_BLEND`: optional diagnostic toggle.
-- `src/wgpu_renderer.rs`:
+- `src/wgpu_renderer.rs`, `src/wgpu_atlas.rs`, `src/shaders.wgsl`:
   - Prefer `Rgba8Unorm` before `Bgra8Unorm` on `wgpu::Backend::Gl` surfaces.
+  - Hardware GPU R/B channel swizzle in `fs_poly_sprite` (`GlobalParams.swap_polychrome_rb`) when uploading BGRA polychrome frames into `Rgba8Unorm` GLES textures, eliminating the per-frame CPU byte-swap loop across 8 MB 1080p video frames on the main UI thread.
+  - 2-slot exact-size texture pool (`recycled_textures`) for large (>1024px) atlas textures so video playback reuses GPU textures instead of calling `glTexStorage2D` / `glDeleteTextures` 60 times/sec on Adreno 650.
 
 ## `vendor/wgpu-hal` (30.0.2)
 - `src/gles/adapter.rs`:

@@ -80,7 +80,7 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    swap_polychrome_rb: u32,
 }
 
 struct GammaParams {
@@ -1293,7 +1293,8 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let raw_sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sample = select(raw_sample, raw_sample.bgra, globals.swap_polychrome_rb != 0u);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);

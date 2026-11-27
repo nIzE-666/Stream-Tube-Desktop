@@ -61,7 +61,7 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    swap_polychrome_rb: u32,
 }
 
 #[repr(C)]
@@ -1478,7 +1478,9 @@ impl WgpuRendererCore {
         let globals = GlobalParams {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
             premultiplied_alpha: premultiplied_alpha as u32,
-            pad: 0,
+            swap_polychrome_rb: u32::from(
+                self.atlas.color_texture_format() == wgpu::TextureFormat::Rgba8Unorm,
+            ),
         };
         let path_globals = GlobalParams {
             premultiplied_alpha: 0,
