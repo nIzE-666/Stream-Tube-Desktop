@@ -755,7 +755,12 @@ impl Render for Shell {
             let slot = cx.global::<crate::ui::slot::MiniSlot>().0.clone();
             crate::ui::slot::SlotFollower::with_slot(slot, a.mini_view.clone())
         });
-        div()
+        // A detached player doesn't receive a hover-out event.
+        let hidden_player = (!has_slot || super::pip::handle(cx).is_some())
+            .then_some(&a.main_view)
+            .filter(|view| view.read(cx).compressor_hovered())
+            .cloned();
+        let shell = div()
             .image_cache(a.images.clone())
             .size_full()
             .relative()
@@ -763,7 +768,11 @@ impl Render for Shell {
             .children(control_overlays())
             .children(main)
             .children(preview)
-            .children(mini)
+            .children(mini);
+        if let Some(view) = hidden_player {
+            view.update(cx, |view, _| view.clear_compressor_hover());
+        }
+        shell
     }
 }
 

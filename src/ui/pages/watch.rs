@@ -504,7 +504,7 @@ impl WatchPage {
                                 let mut v = full.clone();
                                 apply_watch_duration(dur, p.duration, live, &mut v);
                                 if p.channel_id.is_none() {
-                                    p.channel_id = v.channel_id.clone();
+                                    p.set_channel_id(v.channel_id.clone());
                                 }
                                 p.video = Some(v.clone());
                                 store::history_add(&v);

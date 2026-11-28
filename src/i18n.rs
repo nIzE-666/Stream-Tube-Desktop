@@ -93,7 +93,8 @@ impl AppLanguage {
         self.catalog()
             .and_then(|catalog| catalog.messages().get(source))
             .map(String::as_str)
-            .unwrap_or(source)
+            // Context precedes the source label, using gettext's separator.
+            .unwrap_or_else(|| source.split_once('\u{4}').map_or(source, |(_, label)| label))
     }
 }
 
@@ -195,6 +196,9 @@ mod tests {
     fn falls_back_to_the_source_text() {
         assert_eq!(AppLanguage::English.translate("Settings"), "Settings");
         assert_eq!(AppLanguage::Russian.translate("Settings"), "Настройки");
+        assert_eq!(AppLanguage::English.translate("size\u{4}Medium"), "Medium");
+        assert_eq!(AppLanguage::Russian.translate("size\u{4}Medium"), "Средний");
+        assert_eq!(AppLanguage::Russian.translate("Medium"), "Средне");
         assert_eq!(
             AppLanguage::Russian.translate("An untranslated label"),
             "An untranslated label"

@@ -623,7 +623,7 @@ impl SettingsPage {
             .child(row(
                 "Controls shade",
                 "Gradient behind the player controls",
-                self.choice("shade", &[("light".to_string(), "Subtle"), ("default".to_string(), "Default"), ("strong".to_string(), "Strong")], s.controls_shade.clone(), |s, v| s.controls_shade = v, cx),
+                self.choice("shade", &[("light".to_string(), "Subtle"), ("default".to_string(), "Default"), ("strong".to_string(), "shade\u{4}Strong")], s.controls_shade.clone(), |s, v| s.controls_shade = v, cx),
                 cx,
             ))
     }
@@ -760,6 +760,25 @@ impl SettingsPage {
             .child(row("Preferred codec", "", self.choice("codec", &[("vp9".to_string(), "VP9"), ("av1".to_string(), "AV1"), ("h264".to_string(), "H.264")], s.codec_pref.clone(), |s, v| s.codec_pref = v, cx), cx))
             .child(row("Default speed", "", self.choice("speed", &[(0.75f64, "0.75x"), (1.0, "1x"), (1.25, "1.25x"), (1.5, "1.5x"), (1.75, "1.75x"), (2.0, "2x")], s.default_speed, |s, v| s.default_speed = v, cx), cx))
             .child(row("Remember speed per channel", "", switch("rsp", s.remember_speed_per_channel, |s, v| s.remember_speed_per_channel = v, cx), cx))
+            .child(row("Audio compressor", "", switch("audio-compressor", s.audio_compressor, |s, v| s.audio_compressor = v, cx), cx))
+            .child(row(
+                "Compressor strength",
+                "",
+                self.choice(
+                    "compressor-strength",
+                    &crate::player::compressor::PRESETS.map(|preset| (preset.strength, preset.label)),
+                    crate::player::compressor::Strength::parse(&s.audio_compressor_strength),
+                    |s, v| s.audio_compressor_strength = v.id().to_string(),
+                    cx,
+                ),
+                cx,
+            ))
+            .child(row(
+                "Remember compressor per channel",
+                "",
+                switch("remember-compressor", s.remember_compressor_per_channel, |s, v| s.remember_compressor_per_channel = v, cx),
+                cx,
+            ))
             .child(row("Autoplay next video", "", switch("autoplay", s.autoplay_next, |s, v| s.autoplay_next = v, cx), cx))
             .child(row("Resume where you left off", "", switch("resume", s.resume_playback, |s, v| s.resume_playback = v, cx), cx))
             .child(row("Loop videos by default", "", switch("loop", s.loop_video, |s, v| s.loop_video = v, cx), cx))

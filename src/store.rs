@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_UP_NEXT_THUMBNAIL_WIDTH: u32 = 168;
-pub const UP_NEXT_THUMBNAIL_SIZES: &[(u32, &str)] = &[(128, "Small"), (DEFAULT_UP_NEXT_THUMBNAIL_WIDTH, "Medium"), (208, "Large")];
+pub const UP_NEXT_THUMBNAIL_SIZES: &[(u32, &str)] = &[(128, "Small"), (DEFAULT_UP_NEXT_THUMBNAIL_WIDTH, "size\u{4}Medium"), (208, "Large")];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -42,6 +42,9 @@ pub struct Settings {
     pub codec_pref: String,
     pub default_speed: f64,
     pub remember_speed_per_channel: bool,
+    pub audio_compressor: bool,
+    pub audio_compressor_strength: String,
+    pub remember_compressor_per_channel: bool,
     pub autoplay_next: bool,
     pub resume_playback: bool,
     pub volume: f64,
@@ -192,6 +195,9 @@ impl Default for Settings {
             codec_pref: "vp9".into(),
             default_speed: 1.0,
             remember_speed_per_channel: true,
+            audio_compressor: false,
+            audio_compressor_strength: "medium".into(),
+            remember_compressor_per_channel: true,
             autoplay_next: true,
             resume_playback: true,
             volume: 80.0,
@@ -479,6 +485,7 @@ const TABLES: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value
      CREATE TABLE IF NOT EXISTS search_history (query TEXT PRIMARY KEY, at INTEGER NOT NULL);
      CREATE TABLE IF NOT EXISTS feed_cache (channel_id TEXT PRIMARY KEY, json TEXT NOT NULL, fetched_at INTEGER NOT NULL);
      CREATE TABLE IF NOT EXISTS channel_speed (channel_id TEXT PRIMARY KEY, speed REAL NOT NULL);
+     CREATE TABLE IF NOT EXISTS channel_compressor (channel_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
      CREATE TABLE IF NOT EXISTS saved_playlists (playlist_id TEXT PRIMARY KEY, json TEXT NOT NULL, added_at INTEGER NOT NULL);";
 
 /// Opens the database and checks it. A damaged one (its pages no longer agree
@@ -1324,6 +1331,80 @@ pub fn speed_reset_available(channel_id: &str) -> bool {
 
 pub fn clear_channel_speed(channel_id: &str) {
     let _ = db().lock().execute("DELETE FROM channel_speed WHERE channel_id=?1", [channel_id]);
+}
+
+// ────────────────────── per-channel compressor ──────────────────────
+
+pub fn channel_compressor(channel_id: &str) -> Option<bool> {
+    channel_compressor_in(&db().lock(), channel_id)
+}
+
+fn channel_compressor_in(conn: &Connection, channel_id: &str) -> Option<bool> {
+    conn.query_row("SELECT enabled FROM channel_compressor WHERE channel_id=?1", [channel_id], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+pub fn set_channel_compressor(channel_id: &str, enabled: bool) {
+    let _ = set_channel_compressor_in(&db().lock(), channel_id, enabled);
+}
+
+fn set_channel_compressor_in(conn: &Connection, channel_id: &str, enabled: bool) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO channel_compressor VALUES (?1, ?2) ON CONFLICT(channel_id) DO UPDATE SET enabled=excluded.enabled",
+        params![channel_id, enabled],
+    )
+}
+
+pub fn clear_channel_compressor(channel_id: &str) {
+    let _ = clear_channel_compressor_in(&db().lock(), channel_id);
+}
+
+fn clear_channel_compressor_in(conn: &Connection, channel_id: &str) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM channel_compressor WHERE channel_id=?1", [channel_id])
+}
+
+pub fn effective_compressor(channel_id: Option<&str>) -> bool {
+    resolve_compressor(&settings_snapshot(), || channel_id.and_then(channel_compressor))
+}
+
+fn resolve_compressor(settings: &Settings, channel_override: impl FnOnce() -> Option<bool>) -> bool {
+    if settings.remember_compressor_per_channel {
+        channel_override().unwrap_or(settings.audio_compressor)
+    } else {
+        settings.audio_compressor
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn channel_compressor_persistence_and_precedence() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(TABLES).unwrap();
+    let mut settings: Settings = serde_json::from_str("{}").unwrap();
+    assert!(settings.remember_compressor_per_channel);
+    assert_eq!(settings.audio_compressor_strength, "medium");
+
+    let saved = || channel_compressor_in(&conn, "channel");
+    assert_eq!(saved(), None);
+    assert!(!resolve_compressor(&settings, saved));
+    set_channel_compressor_in(&conn, "channel", true).unwrap();
+    assert_eq!(saved(), Some(true));
+    assert_eq!(channel_compressor_in(&conn, "other"), None);
+    assert!(resolve_compressor(&settings, saved));
+
+    settings.audio_compressor = true;
+    set_channel_compressor_in(&conn, "channel", false).unwrap();
+    assert_eq!(saved(), Some(false));
+    assert!(!resolve_compressor(&settings, saved));
+    settings.remember_compressor_per_channel = false;
+    assert!(resolve_compressor(&settings, || panic!("memory is disabled")));
+
+    settings.remember_compressor_per_channel = true;
+    clear_channel_compressor_in(&conn, "channel").unwrap();
+    assert_eq!(saved(), None);
+    assert!(resolve_compressor(&settings, saved));
 }
 
 // ───────────────────────── content filter ─────────────────────────

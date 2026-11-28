@@ -252,6 +252,7 @@ impl Render for ChannelPage {
         let subscribed = store::is_subscribed(&d.info.id);
         let blocked = s.blocked_channels.iter().any(|(i, _)| *i == d.info.id);
         let speed = store::channel_speed(&d.info.id);
+        let compressor = store::channel_compressor(&d.info.id);
         let info2 = d.info.clone();
         let header = div()
             .flex()
@@ -326,6 +327,10 @@ impl Render for ChannelPage {
                                     .pt_2()
                                     .child(subscribe_button("ch-sub".into(), &d.info, subscribed, cx))
                                     .when_some(speed, |el, sp| el.child(pill("ch-speed", Some("gauge"), tf!("{0}x speed", sp), cx)))
+                                    .when_some(compressor.filter(|_| s.remember_compressor_per_channel), |el, enabled| {
+                                        let state = t(if enabled { "On" } else { "Off" });
+                                        el.child(pill("ch-comp", Some("audio-lines"), format!("{} · {state}", t("Audio compressor")), cx))
+                                    })
                                     .child(pill("ch-more", Some("ellipsis"), "", cx).w_9().px_0().justify_center().on_click(move |ev, window, cx| {
                                         let info = info2.clone();
                                         let info3 = info2.clone();
@@ -355,6 +360,14 @@ impl Render for ChannelPage {
                                             let id = info2.id.clone();
                                             items.push(MenuItem::new("gauge", t("Reset remembered speed"), move |_, cx| {
                                                 store::clear_channel_speed(&id);
+                                                cx.refresh_windows();
+                                            }));
+                                        }
+                                        if compressor.is_some() {
+                                            let id = info2.id.clone();
+                                            items.push(MenuItem::new("audio-lines", t("Reset remembered compressor"), move |_, cx| {
+                                                store::clear_channel_compressor(&id);
+                                                crate::player::controller::apply_settings(cx);
                                                 cx.refresh_windows();
                                             }));
                                         }

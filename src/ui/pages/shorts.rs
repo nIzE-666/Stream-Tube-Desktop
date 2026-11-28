@@ -275,6 +275,18 @@ impl ShortsPage {
                                 v.channel_avatar = w.channel.avatar.clone();
                             }
                         }
+                        t.player.update(cx, |p, cx| {
+                            if let Some(v) = p.video.as_mut().filter(|v| v.id == id) {
+                                if v.channel_name.is_empty() {
+                                    v.channel_name = w.channel.name.clone();
+                                }
+                                if p.channel_id.is_none() && !w.channel.id.is_empty() {
+                                    v.channel_id = Some(w.channel.id.clone());
+                                    p.set_channel_id(Some(w.channel.id.clone()));
+                                }
+                                cx.notify();
+                            }
+                        });
                         t.meta.insert(id.clone(), w);
                         let current = t.list.get(t.idx).map(|v| v.id == id).unwrap_or(false);
                         if t.show_comments && current && t.comments.is_none() {

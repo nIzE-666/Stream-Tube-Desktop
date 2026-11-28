@@ -1,4 +1,5 @@
 pub mod aspect;
+pub mod compressor;
 pub mod controller;
 pub mod mpv;
 pub mod view;

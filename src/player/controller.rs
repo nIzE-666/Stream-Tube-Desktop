@@ -1,4 +1,5 @@
 //! Player controller: owns the mpv instance, stream selection, SponsorBlock, queue and progress.
+use super::compressor::{self, Strength};
 use super::mpv::{Mpv, MpvEvent, PropValue};
 use crate::i18n::{t as translate, tf};
 use crate::api::services::{self, Segment};
@@ -122,6 +123,8 @@ pub struct Player {
     preloaded_until: f64,
     pub volume: f64,
     pub muted: bool,
+    pub compressor_enabled: bool,
+    pub compressor_strength: Strength,
     pub speed: f64,
     keyboard_feedback: Option<(KeyboardFeedback, Task<()>)>,
     pub eof: bool,
@@ -302,6 +305,8 @@ impl Player {
             preloaded_until: 0.0,
             volume: s.volume,
             muted: false,
+            compressor_enabled: s.audio_compressor,
+            compressor_strength: Strength::parse(&s.audio_compressor_strength),
             speed: s.default_speed,
             boost: None,
             keyboard_feedback: None,
@@ -618,6 +623,7 @@ impl Player {
         let vol = format!("{}", s.volume.round());
         let ua = crate::api::http::BROWSER_UA;
         let hw = if s.hwdec { "auto-copy" } else { "no" };
+        let af = self.audio_filter_chain(&s.eq_preset);
         let opts: Vec<(&str, &str)> = vec![
             ("vo", "libmpv"),
             ("vid", if self.foreground || self.in_pip { "auto" } else { "no" }),
@@ -640,7 +646,7 @@ impl Player {
             ("hr-seek", "yes"),
             ("force-seekable", "yes"),
             ("audio-client-name", "Stream Tube"),
-            ("af", eq_filter(&s.eq_preset)),
+            ("af", &af),
             ("sub-font-size", "42"),
             ("sub-border-size", "2.5"),
             ("sub-auto", "no"),
@@ -1389,6 +1395,9 @@ impl Player {
         self.set_playback_ready(false, cx);
         self.save_progress(true);
         self.finish_playback_history();
+        self.channel_id = video.channel_id.clone().filter(|id| !id.is_empty());
+        self.compressor_enabled = store::effective_compressor(self.channel_id.as_deref());
+        let reuse_engine = self.mpv.is_some();
         let Some(mpv) = self.ensure_mpv(cx) else {
             self.video = Some(video);
             self.sync_idle(cx);
@@ -1431,12 +1440,14 @@ impl Player {
         self.annotations = Arc::new(Vec::new());
         self.ambient = None;
         self.auto_crop = Default::default();
-        self.channel_id = video.channel_id.clone();
         self.audio_track = None;
         if let Some(old) = self.frame.take() {
             cx.drop_image(old, None);
         }
         let _ = mpv.command(&["stop"]);
+        if reuse_engine {
+            self.apply_audio_filters();
+        }
         store::history_add(&video);
         self.history_report = crate::api::web::PlaybackReport::new(video.id.clone(), serial);
         self.sync_idle(cx);
@@ -1510,7 +1521,7 @@ impl Player {
                             }
                         }
                         if p.channel_id.is_none() && !info.channel_id.is_empty() {
-                            p.channel_id = Some(info.channel_id.clone());
+                            p.set_channel_id(Some(info.channel_id.clone()));
                         }
                         p.storyboard = info.storyboard.clone();
                         p.streams = Some(info);
@@ -1932,6 +1943,9 @@ impl Player {
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let s = store::settings_snapshot();
         self.loop_video = s.loop_video;
+        self.compressor_enabled = store::effective_compressor(self.channel_id.as_deref());
+        self.compressor_strength = Strength::parse(&s.audio_compressor_strength);
+        self.apply_audio_filters();
         if let Some(m) = &self.mpv {
             m.set("hwdec", if s.hwdec { "auto-copy" } else { "no" });
         }
@@ -2145,6 +2159,11 @@ impl Player {
             let ch = f("audio-params/channel-count").map(|c| tf!(", {0} ch", format_args!("{:.0}", c))).unwrap_or_default();
             out.push(("Audio codec", format!("{c}{rate}{ch}")));
         }
+        if self.compressor_enabled {
+            let db = self.compressor_reduction_db().unwrap_or(0.0);
+            let level = if db >= 0.05 { tf!("-{0} dB", format_args!("{db:.1}")) } else { translate("0 dB").into() };
+            out.push(("Audio compressor", format!("{} ({level})", translate(self.compressor_strength.label()))));
+        }
         let kbps = |k: &str| f(k).filter(|b| *b > 0.0).map(|b| tf!("{0} kbps", format_args!("{:.0}", b / 1000.0)));
         let rates = [kbps("video-bitrate").map(|v| tf!("video {0}", v)), kbps("audio-bitrate").map(|a| tf!("audio {0}", a))].into_iter().flatten().collect::<Vec<_>>();
         if !rates.is_empty() {
@@ -2330,12 +2349,85 @@ impl Player {
     }
 
     pub fn set_eq_preset(&mut self, preset: &str) {
-        let filter = eq_filter(preset);
-        if let Some(m) = &self.mpv {
-            m.set("af", filter);
-        }
         let p = if EQ_PRESETS.iter().any(|&(k, _, _)| k == preset) { preset } else { "flat" };
         store::update_settings(|s| s.eq_preset = p.to_string());
+        self.apply_audio_filters();
+    }
+
+    fn audio_filter_chain(&self, eq_preset: &str) -> String {
+        compressor::build_af_chain(eq_filter(eq_preset), self.compressor_enabled.then_some(self.compressor_strength))
+    }
+
+    fn apply_audio_filters(&self) {
+        if let Some(mpv) = &self.mpv {
+            mpv.set("af", &self.audio_filter_chain(&store::settings_snapshot().eq_preset));
+        }
+    }
+
+    pub(crate) fn set_channel_id(&mut self, channel_id: Option<String>) {
+        self.channel_id = channel_id.filter(|id| !id.is_empty());
+        let enabled = store::effective_compressor(self.channel_id.as_deref());
+        if self.compressor_enabled != enabled {
+            self.compressor_enabled = enabled;
+            self.apply_audio_filters();
+        }
+    }
+
+    pub fn toggle_compressor(&mut self, cx: &mut Context<Self>) {
+        self.set_compressor_enabled(!self.compressor_enabled, cx);
+    }
+
+    fn set_compressor_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let settings = store::settings_snapshot();
+        if let Some(id) = self.channel_id.as_deref().filter(|_| settings.remember_compressor_per_channel) {
+            store::set_channel_compressor(id, enabled);
+        } else {
+            store::update_settings(|s| s.audio_compressor = enabled);
+        }
+        self.compressor_enabled = enabled;
+        self.apply_audio_filters();
+        Self::sync_other_compressors(cx);
+        cx.notify();
+    }
+
+    pub fn set_compressor_strength(&mut self, strength: Strength, cx: &mut Context<Self>) {
+        if self.compressor_strength == strength {
+            return;
+        }
+        self.compressor_strength = strength;
+        store::update_settings(|s| s.audio_compressor_strength = strength.id().to_string());
+        if self.compressor_enabled {
+            self.apply_audio_filters();
+        }
+        Self::sync_other_compressors(cx);
+        cx.notify();
+    }
+
+    fn sync_other_compressors(cx: &mut Context<Self>) {
+        let current = cx.entity();
+        let strength = Strength::parse(&store::settings_snapshot().audio_compressor_strength);
+        for other in tab_players(cx).into_iter().filter(|tab| *tab != current) {
+            other.update(cx, |p, cx| {
+                let enabled = store::effective_compressor(p.channel_id.as_deref());
+                let rebuild = enabled != p.compressor_enabled || enabled && strength != p.compressor_strength;
+                p.compressor_enabled = enabled;
+                p.compressor_strength = strength;
+                if rebuild {
+                    p.apply_audio_filters();
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    pub fn compressor_reduction_db(&self) -> Option<f32> {
+        if !self.compressor_enabled || self.paused || self.loading || self.buffering || self.seeking || self.eof {
+            return None;
+        }
+        let mpv = self.mpv.as_ref()?;
+        let input = mpv.get_string(compressor::INPUT_METADATA)?;
+        let output = mpv.get_string(compressor::OUTPUT_METADATA)?;
+        compressor::measure_reduction_db(&input, &output, self.compressor_strength)
     }
 
     pub fn toggle_mute(&mut self) {
@@ -2438,6 +2530,7 @@ impl Player {
             let _ = m.command(&["stop"]);
         }
         self.video = None;
+        self.set_channel_id(None);
         self.streams = None;
         self.loading = false;
         self.autoplay_next = None;
@@ -2856,7 +2949,7 @@ pub fn pick_caption(info: &StreamInfo, pref: &str) -> Option<usize> {
 /// the nearest match when one isn't installed.
 /// Caption looks offered in Settings and in the player's Subtitles/CC options, as (value, label).
 pub const CAPTION_FONTS: &[(&str, &str)] = &[("sans", "Sans-serif"), ("serif", "Serif"), ("mono", "Monospace"), ("casual", "Casual")];
-pub const CAPTION_SIZES: &[(u32, &str)] = &[(30, "Small"), (40, "Medium"), (52, "Large"), (64, "Extra large")];
+pub const CAPTION_SIZES: &[(u32, &str)] = &[(30, "Small"), (40, "size\u{4}Medium"), (52, "Large"), (64, "Extra large")];
 pub const CAPTION_COLORS: &[(u32, &str)] = &[
     (0xFFFFFF, "White"),
     (0xFFFF00, "Yellow"),

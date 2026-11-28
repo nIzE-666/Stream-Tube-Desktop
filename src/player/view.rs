@@ -1,5 +1,6 @@
 //! Video surface + YouTube-style controls.
 use super::aspect;
+use super::compressor;
 use super::controller::{KeyboardFeedback, Player, CAPTION_MARGIN};
 use crate::i18n::{t as translate, tf};
 use crate::api::json::format_duration;
@@ -133,6 +134,7 @@ enum Menu {
     Captions,
     Audio,
     Equalizer,
+    Compressor,
     Aspect,
     AudioOnly,
     Ambient,
@@ -161,6 +163,9 @@ pub struct PlayerView {
     stats_tick: Option<Task<()>>,
     /// Repaints the live `-MM:SS` indicator every second while paused or behind live with controls shown.
     live_tick: Option<Task<()>>,
+    comp_hover: bool,
+    comp_tick: Option<Task<()>>,
+    comp_reduction_db: f32,
     pub mini: bool,
     /// shown in the picture-in-picture window
     pub pip: bool,
@@ -204,6 +209,9 @@ impl PlayerView {
         Self {
             stats_tick: None,
             live_tick: None,
+            comp_hover: false,
+            comp_tick: None,
+            comp_reduction_db: 0.0,
             player,
             mini,
             pip: false,
@@ -263,7 +271,7 @@ impl PlayerView {
     }
 
     fn controls_visible(&self, paused: bool) -> bool {
-        paused || self.menu.is_some() || self.drag_seek.is_some() || Instant::now() < self.show_until
+        paused || self.menu.is_some() || self.drag_seek.is_some() || self.comp_hover || Instant::now() < self.show_until
     }
 
     /// Closes the gear menu if it is open (Esc closes it before leaving the page).
@@ -274,6 +282,51 @@ impl PlayerView {
         self.menu_closed_at = std::time::Instant::now();
         cx.notify();
         true
+    }
+
+    pub(crate) fn compressor_hovered(&self) -> bool {
+        self.comp_hover
+    }
+
+    pub(crate) fn clear_compressor_hover(&mut self) {
+        self.comp_hover = false;
+        self.comp_tick = None;
+        self.comp_reduction_db = 0.0;
+    }
+
+    fn sync_compressor_meter(&mut self, cx: &mut Context<Self>) {
+        let pl = self.player.read(cx);
+        if !self.comp_hover
+            || self.menu.is_some()
+            || !pl.compressor_enabled
+            || pl.video.is_none()
+            || pl.paused
+            || pl.loading
+            || pl.buffering
+            || pl.seeking
+            || pl.eof
+        {
+            self.comp_tick = None;
+            self.comp_reduction_db = 0.0;
+            return;
+        }
+        if self.comp_tick.is_none() {
+            if let Some(db) = pl.compressor_reduction_db() {
+                self.comp_reduction_db = db;
+            }
+            self.comp_tick = Some(cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                if this.update(cx, |this, cx| {
+                    let measured = this.player.read(cx).compressor_reduction_db();
+                    this.comp_reduction_db = measured
+                        .map(|db| compressor::smooth_reduction_db(this.comp_reduction_db, db))
+                        .unwrap_or(0.0);
+                    cx.notify();
+                }).is_err() {
+                    break;
+                }
+            }));
+        }
     }
 
     fn finish_pointer_press(&mut self, cx: &mut Context<Self>) {
@@ -486,6 +539,7 @@ impl Render for PlayerView {
                 this.hovering = *h;
                 if !*h {
                     this.hover_frac = None;
+                    this.clear_compressor_hover();
                     this.finish_pointer_press(cx);
                 }
                 cx.notify();
@@ -750,6 +804,7 @@ impl Render for PlayerView {
         }
 
         if mini {
+            self.clear_compressor_hover();
             return root.child(self.render_mini_controls(show, paused, time, duration, radius, cx)).into_any_element();
         }
 
@@ -837,6 +892,7 @@ impl Render for PlayerView {
         if !show {
             // the controls faded out under a still pointer: no hover-out comes for them
             self.vol_hover = false;
+            self.clear_compressor_hover();
         }
         if show {
             if !self.mini && !self.pip && store::settings_snapshot().show_player_title {
@@ -1386,6 +1442,10 @@ impl PlayerView {
         let hide_time = narrow && vol_open && bar_w < 400.0;
         let compact = bar_w > 0.0 && bar_w < 760.0;
         let label_jump = bar_w >= 900.0;
+        if narrow {
+            self.clear_compressor_hover();
+        }
+        self.sync_compressor_meter(cx);
 
         // seek bar: one segment per chapter (2px gaps), hovered chapter grows
         let active = hover.is_some() || self.drag_seek.is_some();
@@ -1657,7 +1717,8 @@ impl PlayerView {
                                     cx.notify();
                                 }),
                             ),
-                    )),
+                    ))
+                    .when(!narrow, |d| d.child(self.render_compressor_button(compact, cx))),
             )
             .when(!hide_time && is_live, |d| {
                 let dot_color: Hsla = if at_live_edge { rgb(0xff0000).into() } else { hsla(0., 0., 0.65, 1.) };
@@ -1923,6 +1984,110 @@ impl PlayerView {
             )
     }
 
+    fn render_compressor_button(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = pal(cx);
+        let enabled = self.player.read(cx).compressor_enabled;
+        let reducing = self.comp_reduction_db >= 0.5;
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id("c-comp")
+                    .size(if compact { px(32.) } else { px(40.) })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .when(enabled, |d| {
+                        d.bg(p.accent.opacity(0.28))
+                            .border_1()
+                            .border_color(p.accent.opacity(if reducing { 0.9 } else { 0.4 }))
+                    })
+                    .hover(move |d| d.bg(if enabled { p.accent.opacity(0.4) } else { hsla(0., 0., 1., 0.15) }))
+                    .child(icon("audio-lines").size(if compact { px(20.) } else { px(24.) })
+                        .text_color(if enabled { p.accent } else { hsla(0., 0., 1., 0.7) }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.player.update(cx, |pl, cx| pl.toggle_compressor(cx));
+                        this.poke(cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.menu = Some(Menu::Compressor);
+                        this.sync_compressor_meter(cx);
+                        this.poke(cx);
+                    }))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.comp_hover = true;
+                            this.sync_compressor_meter(cx);
+                        } else {
+                            this.clear_compressor_hover();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(self.comp_hover && !self.mini && self.menu.is_none(), |d| d.child(self.render_compressor_card(cx)))
+    }
+
+    fn render_compressor_card(&self, cx: &App) -> impl IntoElement {
+        let p = pal(cx);
+        let pl = self.player.read(cx);
+        let enabled = pl.compressor_enabled;
+        let reduction = self.comp_reduction_db.round() as u32;
+        let (status, description) = if !enabled {
+            (translate("Off").to_string(), translate("Evens out sudden volume spikes").to_string())
+        } else if self.comp_reduction_db >= 0.5 {
+            (tf!("-{0} dB", reduction), tf!("Reducing loud audio by {0} dB", reduction))
+        } else {
+            (translate("0 dB").to_string(), translate("Active — audio level is normal").to_string())
+        };
+        let channel_aware = store::settings_snapshot().remember_compressor_per_channel && pl.channel_id.is_some();
+        let click = match (enabled, channel_aware) {
+            (true, true) => "Click to disable on this channel",
+            (false, true) => "Click to enable on this channel",
+            (true, false) => "Click to disable",
+            (false, false) => "Click to enable",
+        };
+        let muted = hsla(0., 0., 1., 0.64);
+        let detail = |label: &str, value: String| {
+            div().flex().justify_between().gap_2()
+                .child(div().flex_none().text_color(muted).child(translate(label).to_string()))
+                .child(div().min_w_0().truncate().child(value))
+        };
+        div()
+            .absolute()
+            .left_0()
+            .bottom(px(48.))
+            .w(px(320.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(hsla(0., 0., 1., 0.15))
+            .bg(hsla(0., 0., 0.09, 0.97))
+            .shadow_lg()
+            .text_xs()
+            .text_color(white())
+            .child(div().flex().justify_between().gap_2()
+                .child(div().text_color(muted).child(translate("Audio compressor")))
+                .child(div().font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if enabled { p.accent } else { muted }).child(status)))
+            .child(div().text_sm().child(description))
+            .child(detail("Strength", translate(pl.compressor_strength.label()).into()))
+            .when_some(pl.video.as_ref().map(|v| &v.channel_name).filter(|name| !name.is_empty()), |d, name| {
+                d.child(detail("Channel", name.clone()))
+            })
+            .child(div().border_t_1().border_color(hsla(0., 0., 1., 0.15)).pt_2().text_color(muted)
+                .child(div().child(translate(click)))
+                .child(div().child(translate("Right-click for strength"))))
+    }
+
     /// Ends a seek-bar or volume drag: seeks to where the bar was let go.
     fn finish_drag(&mut self, cx: &mut Context<Self>) {
         if let Some(f) = self.drag_seek.take() {
@@ -2111,6 +2276,11 @@ impl PlayerView {
                         let cur = translate(crate::player::controller::eq_label(&store::settings_snapshot().eq_preset)).to_string();
                         row("m-eq".into(), Some("sliders-horizontal"), translate("Equalizer").into(), Some(cur), false)
                             .on_click(cx.listener(|t, _, _, cx| { t.menu = Some(Menu::Equalizer); cx.notify() }))
+                    })
+                    .child({
+                        let cur = if pl.compressor_enabled { pl.compressor_strength.label() } else { "Off" };
+                        row("m-comp".into(), Some("audio-lines"), translate("Audio compressor").into(), Some(translate(cur).into()), false)
+                            .on_click(cx.listener(|this, _, _, cx| { this.menu = Some(Menu::Compressor); cx.notify(); }))
                     })
                     .when(!audio_only, |d| {
                         let cur = translate(aspect::label(&store::settings_snapshot().aspect_mode)).to_string();
@@ -2341,6 +2511,24 @@ impl PlayerView {
                         t.menu = Some(Menu::CaptionOptions);
                         cx.notify();
                     })));
+                }
+            }
+            Menu::Compressor => {
+                let enabled = pl.compressor_enabled;
+                let selected = pl.compressor_strength;
+                panel = panel
+                    .child(header("Audio compressor", Menu::Main, cx))
+                    .child(row("comp-enabled".into(), None, translate("Enabled").into(), None, false)
+                        .child(div().text_color(hsla(0., 0., 1., 0.7)).child(translate(if enabled { "On" } else { "Off" })))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.player.update(cx, |pl, cx| pl.toggle_compressor(cx));
+                        })))
+                    .child(div().mx_3().my_1().h(px(1.)).bg(hsla(0., 0., 1., 0.15)));
+                for preset in compressor::PRESETS {
+                    panel = panel.child(row(SharedString::from(format!("comp-{}", preset.id)), None, translate(preset.label).into(), None, preset.strength == selected)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.player.update(cx, |pl, cx| pl.set_compressor_strength(preset.strength, cx));
+                        })));
                 }
             }
             Menu::Aspect => {
